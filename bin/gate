@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Run a tier's gate and say only whether it passed.
+
+    bin/gate              every tier
+    bin/gate api          just that one
+    bin/gate api web      two of them
+
+The gates themselves are unchanged - this runs exactly the commands the
+project declares. What is different is where their output goes. A
+`mix precommit` prints a compile, a credo pass and several hundred tests;
+`npm run build` prints tsr, two tsc passes and vite. Read into an assistant's
+context that is thousands of tokens a run, several runs a session, and none of
+it is worth keeping once the answer is PASS. So the log goes to .gate-logs/ and
+stdout is the verdict. When something is red, the path to the whole log is on
+the last line.
+
+**What each tier is lives in `.claude/gates.json`, not in here.** This file
+held three hand-written shell functions at first, and so did
+`guard.py` and `statusline-extra.py` in their own words - three copies of one
+list, which is three chances to drift. Now they all read the one file, and this
+script is the same for every project. See that file's own header.
+
+A tier may refuse to run: `refuses_port` is a port whose being up means the
+gate would damage something (a dev server the compile would build over), and
+`requires_port` is one whose being down means the gate would quietly run a
+smaller suite than it says. Both are refusals rather than warnings, because a
+gate that passed less than it claims is worse than one that did not run. Set
+any of the `force_env` names to 1 to insist.
+"""
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+BOLD, GREEN, RED, DIM, OFF = "\033[1m", "\033[32m", "\033[31m", "\033[2m", "\033[0m"
+
+
+def root() -> str:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except OSError:
+        pass
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def config(project: str) -> dict:
+    path = os.path.join(project, ".claude", "gates.json")
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        sys.exit(
+            f"No {os.path.relpath(path, project)}. That file is what says which "
+            "gates this project has - copy one from another project, or run "
+            "`/init-workbench`."
+        )
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{path} is not valid JSON: {exc}")
+
+
+def listening(port: int) -> bool:
+    return subprocess.run(
+        ["lsof", "-ti", f"tcp:{port}"], capture_output=True
+    ).returncode == 0
+
+
+def hms(seconds: int) -> str:
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def summarise(spec: dict, log: str, ok: bool) -> str:
+    """One line out of a log that has thousands. A tier says how: `any` is
+    tried whatever the outcome, `pass` and `fail` only on theirs, and `count`
+    reports how many times something appears rather than what it said."""
+    text = ""
+    try:
+        with open(log, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        pass
+
+    for key in ("any", "pass" if ok else "fail"):
+        rule = spec.get(key)
+        if not rule:
+            continue
+        if isinstance(rule, dict) and "count" in rule:
+            n = text.count(rule["count"])
+            return rule.get("as", "{n}").replace("{n}", str(n))
+        for pattern in rule if isinstance(rule, list) else [rule]:
+            found = re.findall(pattern, text)
+            if found:
+                last = found[-1]
+                # A group in the pattern makes findall return the group, not
+                # the line. Re-search for the whole match instead.
+                whole = None
+                for m in re.finditer(pattern, text):
+                    whole = m.group(0)
+                return (whole or (last if isinstance(last, str) else "")).strip()
+    return spec.get("default", "")
+
+
+def run(tier: dict, project: str, logs: str, force: bool) -> str:
+    """PASS, FAIL or SKIP. Prints its own row."""
+    name = tier["name"]
+    pad = f"{name:<7}"
+
+    def refuse(why: str, hint: str) -> str:
+        print(f"{RED}{pad} SKIP{OFF}  {why}")
+        if hint:
+            print(f"{DIM}   {hint}{OFF}")
+        return "SKIP"
+
+    # The force switch is for the refusals: a gate that would build over
+    # something live is a judgement a person can overrule, and running it
+    # anyway is sometimes right. It is deliberately **not** for the
+    # requirements. Forcing past a store that is not answering buys a green
+    # that covered less than it claims, which is the one thing a gate must
+    # never produce - and the bash this replaced never allowed it either.
+    if not force:
+        for port in tier.get("refuses_port", []):
+            if listening(port["port"]):
+                return refuse(port["why"], port.get("hint", ""))
+    for port in tier.get("requires_port", []):
+        if not listening(port["port"]):
+            return refuse(port["why"], port.get("hint", ""))
+
+    # Two runs of one tier share `<tier>.log` and `<tier>.verdict`, so the
+    # second truncates the first's log mid-write and one of the two verdicts is
+    # about the other's run. It happens on a repository two sessions share, and
+    # it happened to me: an api log at 0 bytes beside a
+    # verdict five minutes older than either run. They should not overlap
+    # anyway - both compile the same tree - so this refuses rather than
+    # interleaves. The lock is released when this process exits.
+    lock = open(os.path.join(logs, f"{name}.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"{RED}{pad} BUSY{OFF}  another run of this tier is already in flight.")
+        print(f"{DIM}   Both would write {name}.log and {name}.verdict. "
+              f"Wait for it, or read its log when it lands.{OFF}")
+        return "BUSY"
+
+    log = os.path.join(logs, f"{name}.log")
+    cwd = os.path.join(project, tier.get("dir", "."))
+    env = dict(os.environ, **{k: str(v) for k, v in tier.get("env", {}).items()})
+
+    t0 = time.time()
+    with open(log, "w") as fh:
+        code = subprocess.run(
+            tier["cmd"], shell=True, cwd=cwd, env=env, stdout=fh, stderr=subprocess.STDOUT
+        ).returncode
+    elapsed = int(time.time() - t0)
+    ok = code == 0
+    # With no `summary` rule the command itself is the best short answer there
+    # is - but a command can be a hundred characters of shell, and this line is
+    # meant to be readable beside a clock. Cut it.
+    summary = summarise(tier.get("summary", {}), log, ok)
+    if not summary:
+        summary = tier["cmd"]
+        if len(summary) > 60:
+            summary = summary[:57].rstrip() + "..."
+
+    if ok:
+        print(f"{GREEN}{pad} PASS{OFF}  {DIM}{hms(elapsed)}  {summary}{OFF}")
+        return "PASS"
+
+    print(f"{RED}{BOLD}{pad} FAIL{OFF}  {DIM}{hms(elapsed)}{OFF}  {summary}")
+    print(f"{DIM}   full log: {log}{OFF}")
+    print(f"{DIM}   ---{OFF}")
+    try:
+        with open(log, errors="replace") as fh:
+            for line in fh.read().splitlines()[-25:]:
+                print(f"   {line}")
+    except OSError:
+        pass
+    print(f"{DIM}   ---{OFF}")
+    return "FAIL"
+
+
+def main() -> int:
+    project = root()
+    cfg = config(project)
+    tiers = {t["name"]: t for t in cfg.get("tiers", [])}
+    if not tiers:
+        sys.exit(".claude/gates.json declares no tiers.")
+
+    wanted = sys.argv[1:] or ["all"]
+    if wanted == ["all"]:
+        wanted = list(tiers)
+    unknown = [w for w in wanted if w not in tiers]
+    if unknown:
+        print(
+            f"usage: bin/gate [{'|'.join(tiers)}|all]   (no such tier: {', '.join(unknown)})",
+            file=sys.stderr,
+        )
+        return 64
+
+    force = any(os.environ.get(name) == "1" for name in cfg.get("force_env", ["GATE_FORCE"]))
+    logs = os.path.join(project, ".gate-logs")
+    os.makedirs(logs, exist_ok=True)
+
+    failed = False
+    for name in wanted:
+        said = run(tiers[name], project, logs, force)
+        if said == "BUSY":
+            # Nothing ran, so nothing here has an opinion about that tier -
+            # and the run that is in flight owns the verdict file.
+            failed = True
+            continue
+        # The verdict outlives the run. `bin/gate` prints PASS to a terminal
+        # that is scrolled away ten minutes later; the status line reads this
+        # file instead, so "is it green, and how long ago" stops being a
+        # question anyone has to ask.
+        #
+        # Written through a temporary file rather than into place. Two sessions
+        # share this repository and the status line reads this file on every
+        # prompt, so a plain `open(..., "w")` - which truncates before it
+        # writes - has a window where a reader gets an empty string, and an
+        # empty string is not PASS. The window is small and has not been seen
+        # to open; `os.replace` costs nothing and closes it.
+        tmp = os.path.join(logs, f".{name}.verdict.{os.getpid()}")
+        with open(tmp, "w") as fh:
+            fh.write(said)
+        os.replace(tmp, os.path.join(logs, f"{name}.verdict"))
+        failed = failed or said != "PASS"
+
+    print(f"{DIM}green.{OFF}" if not failed else f"{RED}{BOLD}not green - nothing ships.{OFF}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

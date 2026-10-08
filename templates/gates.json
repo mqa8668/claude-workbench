@@ -1,0 +1,64 @@
+{
+  "$comment": [
+    "Copy this to <project>/.claude/gates.json and edit. It is the one place a",
+    "project says what its gates are; bin/gate runs them, guard.py refuses the",
+    "bare command that would print a gate's whole log into a session, and",
+    "statusline-extra.py reports which verdicts are green and how stale.",
+    "",
+    "tier:   name, dir it runs in, cmd, and `watch` - the paths whose being",
+    "        written since the verdict make that verdict stale.",
+    "guard:  regexes for the bare command this tier replaces. Optional.",
+    "env:    variables the gate needs and a person keeps forgetting.",
+    "refuses_port / requires_port: a gate that would damage something, or one",
+    "        that would quietly run less than it claims. Both refuse; set a",
+    "        force_env name to 1 to insist.",
+    "summary: how to get one line out of the log. `any` is tried whatever",
+    "        happened, `pass` and `fail` only on theirs, and a `count` object",
+    "        reports how many times a string appears.",
+    "checks: things a person runs by hand that still leave a verdict behind.",
+    "ports:  what the status line watches, as [port, label, glyph].",
+    "deny:   any other bare command this project would rather not see.",
+    "cheap_agents: agents the five-hour brake lets through even when the",
+    "        window is nearly spent, because re-running one costs almost",
+    "        nothing. Default: [\"gate\"]."
+  ],
+
+  "force_env": ["GATE_FORCE"],
+  "cheap_agents": ["gate"],
+
+  "tiers": [
+    {
+      "name": "web",
+      "dir": "web",
+      "cmd": "npm run build",
+      "watch": ["web/"],
+      "guard": ["\\bnpm\\s+run\\s+build\\b"],
+      "summary": {
+        "pass": ["✓ built in [0-9.]+m?s"],
+        "fail": { "count": "error TS", "as": "{n} tsc errors" },
+        "default": "typecheck, build"
+      }
+    },
+    {
+      "name": "server",
+      "dir": "server",
+      "cmd": "ruff check . && pytest -q",
+      "watch": ["server/"],
+      "requires_port": [
+        {
+          "port": 5432,
+          "why": "nothing is on :5432, so the database tests would not run.",
+          "hint": "docker compose up -d db"
+        }
+      ],
+      "summary": {
+        "any": ["[0-9]+ passed.*", "[0-9]+ failed.*"],
+        "default": "lint, tests"
+      }
+    }
+  ],
+
+  "checks": [],
+  "ports": [[5173, "5173", "react"], [5432, "5432", "store"]],
+  "deny": []
+}

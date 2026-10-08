@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+#
+# What a day of delegating cost, and what shape it was.
+#
+#     bin/agents              today
+#     bin/agents --all        every session in the ledger
+#     bin/agents --session 48657a78
+#
+# Two numbers are wanted, and reported apart - what the coordination cost and
+# what scope the job discovered - and at first neither of them
+# existed. The answer to "what did today cost" was assembled by asking each
+# agent what it had spent and adding it up in a message: an estimate wearing a
+# table's clothes, available only to the session that thought to ask.
+#
+# This reads `.claude/.state/agents.jsonl`, which two hooks write:
+#
+#     spawn   agents.py, on the Agent tool
+#     round   agents.py, on SendMessage - the expensive one, and the one that
+#             left no trace anywhere at first
+#     cost    subagent.py, on SubagentStop, summed from the agent's own
+#             transcript rather than from anything it says about itself
+#
+# `cost` rows are cumulative, not additive. SubagentStop fires each time an
+# agent finishes responding, so a continued agent writes one at the end of
+# every round, each summing a longer version of the same transcript. Adding
+# them up multiplies exactly the agents this file exists to measure, so only
+# the last row per agent id counts.
+#
+# One join is imperfect and worth knowing about: a spawn row carries the
+# `subagent_type`, a cost row carries the name the transcript attributes the
+# work to, and a round row carries whatever `SendMessage` was addressed to -
+# which for a background agent can be an id rather than a name. They agree for
+# the typed agents in `.claude/agents/`, and an untyped one can show as two
+# lines, one holding the spawns and one holding the tokens.
+#
+# The column that matters is `turns`, and it was `rounds` in an earlier version. A round is expensive for the reason it always was - round n re-sends
+# everything rounds 1..n-1 accumulated - but so is turn n of a single run, and
+# the measurement found a run of 342 requests costing 78M against a 48k cold
+# start. Cost goes as **the square of a run's turns**, so a total cannot show
+# where a day went; the long runs named at the foot of this report can.
+# `guard.py` now caps rounds at one and names 150 requests as the budget.
+#
+# Two token columns, because one would be a lie either way:
+#
+#     fresh   input + cache_creation + output, summed over the agent's turns.
+#             What it actually made the model read and write for the first
+#             time.
+#     read    cache_read, summed. The same context handed back turn after
+#             turn. **This is the column rounds inflate** - it is volume, not
+#             money, since a cache read is billed at a fraction of a fresh
+#             one, and it climbs with the square of an agent's turns.
+#
+# Neither is a price and this file does not try to be a bill. What it answers
+# is where a day's delegating went and what shape it had.
+#
+# **`batch` is the column to act on**, and it was the one thing the first
+# measurement said was the largest lever and nothing could see. A turn is one
+# API request, cost goes as the square of a run's turns, and two tool calls in
+# one message is one turn - so the share of an agent's acting messages that
+# carried more than one call is the share of the saving being taken. It ran
+# 2-16% across the runs it was first fitted to. A message with no tool call in
+# it is a report or a question and is in neither half; this is not a nudge to
+# make one.
+#
+# It is blank for runs billed before it existed, and it always will be - the
+# figure comes from the transcript at SubagentStop and is not backfilled.
+
+import collections
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+LEDGER = ".claude/.state/agents.jsonl"
+
+# Requests in one run before it is worth naming. Kept in step with `guard.py`'s
+# constant of the same name by hand - one is a refusal a session reads, this
+# one is a line a person reads afterwards, and nothing imports across that.
+TURN_BUDGET = 150
+
+# What a request adds to an agent's context: fitted per run over the twelve
+# biggest, 905-2,856 with a median near this. Only used to put an order of
+# magnitude beside a long run, so a round number is the honest form.
+GROWTH = 1600
+
+# `turns` once counted transcript rows, and a row is not a
+# request - one message with two tool calls is two rows carrying one usage.
+# Rows written before that fix read about 1.55x high and are not restated here,
+# because the transcripts they were summed from are what they are.
+#
+# **Told apart by a field, not by a date.** The fix landed mid-afternoon, so
+# rows from earlier the same day are in the old unit and no `ts <` comparison
+# can separate them. `subagent.py` stamps `unit: req` on everything it writes
+# now; a row without one predates it.
+OLD_UNIT_RATIO = 1.55
+
+
+def local_day(stamp: str, back: int = 0) -> str:
+    """The local calendar day a UTC stamp falls in, `back` seconds earlier.
+
+    **The stamps are UTC and the person reading this is not.** `day` comes from
+    a naive `datetime.now()`, so on a +0700 box a plain `startswith` hid
+    everything done after 17:00 UTC from the next morning's report - which is
+    most of an evening session, on a project whose sessions run late.
+    """
+    dt = datetime.fromisoformat(stamp)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - timedelta(seconds=back)).astimezone().strftime("%Y-%m-%d")
+
+
+def in_day(row: dict, day: str) -> bool:
+    """Whether a ledger row belongs to `day`, in local time.
+
+    A `cost` row is stamped when the agent **stopped**, so a run spawned before
+    midnight and billed after it landed in the next day's report without the
+    spawn row that opened it - one run split across two windows, counted whole
+    in neither. The row carries `secs`, so the start is knowable: a run is
+    attributed to the day it **began**, which is the day its spawn row is
+    already in. Anything unparseable is dropped from a dated window rather than
+    guessed into one; `--all` still shows it.
+    """
+    stamp = row.get("ts") or ""
+    back = int(row.get("secs") or 0) if row.get("kind") == "cost" else 0
+    try:
+        return local_day(stamp, back) == day
+    except (ValueError, TypeError):
+        return False
+
+
+def denied_repeat(row: dict, prev: dict) -> bool:
+    """Whether this row is the same call the guard refused a moment ago.
+
+    `guard.py` and `agents.py` both match the Agent tool and `SendMessage`, and
+    hooks for one event run in parallel - so the ledger cannot see the exit
+    code, and a refused call is written down exactly like a delivered one. The
+    caller is then told to repeat it, and repeats it, and the ledger holds two.
+    With a round cap of one, every real round past the first produces a pair.
+
+    Same session, same kind, same agent, same payload size, same description,
+    and adjacent in the file within five minutes: that is one call written
+    twice, not two calls. **What it cannot tell apart** is a fan-out that spawns
+    two agents of one type under the identical description within that window -
+    give them distinct descriptions and they are distinct here too.
+    """
+    if not prev or prev.get("kind") != row.get("kind"):
+        return False
+    for field in ("session", "agent", "chars", "desc"):
+        if prev.get(field) != row.get(field):
+            return False
+    try:
+        gap = datetime.fromisoformat(row.get("ts") or "") - datetime.fromisoformat(
+            prev.get("ts") or ""
+        )
+    except (ValueError, TypeError):
+        return False
+    return 0 <= gap.total_seconds() <= 300
+
+
+def span(secs: int) -> str:
+    """A run's wall-clock, and the word is deliberate. This is the distance
+    between an agent's first and last transcript row, so a continued agent's
+    idle between rounds is inside it. It is not time the model spent working
+    and must never be quoted as though it were."""
+    if secs >= 3600:
+        return f"{secs / 3600:.1f}h"
+    if secs >= 60:
+        return f"{secs // 60}m"
+    return f"{secs}s"
+
+
+def human(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+def main() -> int:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, LEDGER)
+    if not os.path.exists(path):
+        print("no ledger yet - nothing has been delegated from this repo.")
+        return 0
+
+    args = sys.argv[1:]
+    want = None
+    if "--session" in args:
+        rest = args[args.index("--session") + 1:]
+        if not rest:
+            print("usage: bin/agents [--all | --session <id>]")
+            return 2
+        want = rest[0][:8]
+    day = None if ("--all" in args or want) else datetime.now().strftime("%Y-%m-%d")
+
+    rows = []
+    dropped = 0
+    prev = None
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if denied_repeat(row, prev):
+                dropped += 1
+                continue
+            prev = row
+            if want and row.get("session") != want:
+                continue
+            if day and not in_day(row, day):
+                continue
+            rows.append(row)
+
+    if not rows:
+        print("nothing in that window.")
+        return 0
+
+    agents = collections.defaultdict(
+        lambda: {
+            "spawns": 0, "rounds": 0, "turns": 0,
+            "fresh": 0, "read": 0, "brief": 0, "secs": 0,
+            "msgs": 0, "multi": 0,
+        }
+    )
+    # Last cost row per agent id wins - see the note at the top. File order is
+    # time order, so the last one seen is the whole bill.
+    billed = {}
+    for row in rows:
+        kind = row.get("kind", "spawn")
+        if kind == "cost":
+            billed[row.get("id") or row.get("ts")] = row
+            continue
+        a = agents[row.get("agent") or "?"]
+        if kind == "spawn":
+            a["spawns"] += 1
+            a["brief"] += 1 if row.get("brief") else 0
+        elif kind == "round":
+            a["rounds"] += 1
+
+    for row in billed.values():
+        a = agents[row.get("agent") or "?"]
+        a["turns"] += row.get("turns") or 0
+        a["msgs"] += row.get("msgs") or 0
+        a["multi"] += row.get("multi") or 0
+        a["fresh"] += (row.get("in") or 0) + (row.get("out") or 0)
+        a["read"] += row.get("cache_read") or 0
+        a["secs"] += row.get("secs") or 0
+
+    order = sorted(
+        agents.items(),
+        key=lambda kv: (-kv[1]["fresh"], -(kv[1]["spawns"] + kv[1]["rounds"]), kv[0]),
+    )
+    print(
+        f"{'agent':<16}{'spawns':>7}{'rounds':>8}{'turns':>7}"
+        f"{'fresh':>8}{'read':>8}{'span':>7}{'batch':>7}{'brief':>7}"
+    )
+    print("-" * 75)
+    total = collections.Counter()
+    for name, a in order:
+        brief = f"{100 * a['brief'] // a['spawns']}%" if a["spawns"] else "-"
+        batch = f"{100 * a['multi'] // a['msgs']}%" if a["msgs"] else "-"
+        print(
+            f"{name:<16}{a['spawns']:>7}{a['rounds']:>8}{a['turns']:>7}"
+            f"{human(a['fresh']):>8}{human(a['read']):>8}"
+            f"{span(a['secs']):>7}{batch:>7}{brief:>7}"
+        )
+        for k, v in a.items():
+            total[k] += v
+    print("-" * 75)
+    all_batch = f"{100 * total['multi'] // total['msgs']}%" if total["msgs"] else "-"
+    print(
+        f"{'':<16}{total['spawns']:>7}{total['rounds']:>8}{total['turns']:>7}"
+        f"{human(total['fresh']):>8}{human(total['read']):>8}"
+        f"{span(total['secs']):>7}{all_batch:>7}"
+    )
+
+    # A billed agent per spawn is what a complete picture looks like. Fewer
+    # means agents still running, or a session that predates subagent.py - say
+    # so rather than letting the token column read as the whole bill.
+    if total["msgs"] and 100 * total["multi"] // total["msgs"] < 15:
+        share = 100 * total["multi"] // total["msgs"]
+        print(
+            f"\n{100 - share}% of acting messages carried a single tool call, so "
+            f"each bought a turn of its own. Cost goes as the square of turns: "
+            f"batching the reads and probes that do not depend on each other is "
+            f"the cheapest thing on the list."
+        )
+
+    if dropped:
+        print(
+            f"\n{dropped} row(s) collapsed: a call `guard.py` refused is written "
+            f"to the ledger anyway, and the repeat that followed it is the same "
+            f"call, not a second one."
+        )
+
+    costed = len(billed)
+    if costed > total["spawns"]:
+        print(
+            f"\n{costed - total['spawns']} run(s) billed here were spawned "
+            f"before this window - a run is filed under the day it began, so "
+            f"its spawn row is in an earlier one."
+        )
+    if costed < total["spawns"]:
+        print(
+            f"\n{total['spawns'] - costed} of {total['spawns']} still running or "
+            f"unbilled - the token columns are a floor."
+        )
+    if total["rounds"] > total["spawns"]:
+        print(
+            f"\n{total['rounds']} rounds against {total['spawns']} spawns. Rounds "
+            f"carry the whole accumulated transcript; batch the findings and "
+            f"make the second one a spawn."
+        )
+
+    # The column that actually predicts the bill. Cost goes as the square of a
+    # run's turns, so one long run outweighs a dozen short ones and a total
+    # cannot show that - only the runs themselves can.
+    long_runs = sorted(
+        ((row.get("turns") or 0, row.get("agent") or "?") for row in billed.values()),
+        reverse=True,
+    )
+    over = [x for x in long_runs if x[0] > TURN_BUDGET]
+    if over:
+        print(
+            f"\n{len(over)} run(s) over {TURN_BUDGET} requests. Cost goes as the "
+            f"square of them - each should have written EVIDENCE.md and handed "
+            f"back:"
+        )
+        for turns, name in over[:6]:
+            implied = turns * turns * GROWTH // 2
+            print(f"  {name:<16}{turns:>5} req   ~{human(implied):>6} read")
+        over_ids = {name for _, name in over}
+        stale = sum(
+            1
+            for row in billed.values()
+            if not row.get("unit") and (row.get("agent") or "?") in over_ids
+        )
+        if stale:
+            print(
+                f"  ({stale} of these predate the unit fix: they counted "
+                f"transcript lines rather than requests and read about "
+                f"{OLD_UNIT_RATIO}x high.)"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

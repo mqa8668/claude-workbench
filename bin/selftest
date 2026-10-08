@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Run every check this package has on itself.
+
+    bin/selftest
+
+Nothing here touches a real project: each test builds a throwaway git
+repository in a temp directory, writes the config it wants, and runs the
+package's own files against it the way Claude Code would. It needs no network,
+no server and no fixtures.
+
+Run it before committing a change here, and after installing the package
+somewhere new. The failure this exists to catch is the one that installs
+cleanly and does nothing: a hook wired to a path that moved, an agent with no
+model pinned, a guard that reads a list it no longer has.
+"""
+
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TESTS = os.path.join(ROOT, "tests")
+
+BOLD, GREEN, RED, DIM, OFF = "\033[1m", "\033[32m", "\033[31m", "\033[2m", "\033[0m"
+
+
+def main() -> int:
+    files = sorted(f for f in os.listdir(TESTS)
+                   if f.startswith("test_") and f.endswith(".py"))
+    if not files:
+        print("no tests found", file=sys.stderr)
+        return 1
+
+    failed = 0
+    for name in files:
+        result = subprocess.run([sys.executable, os.path.join(TESTS, name)])
+        failed += result.returncode
+        print()
+
+    if failed:
+        print(f"{RED}{BOLD}{failed} failing.{OFF}")
+        return 1
+    print(f"{GREEN}all green.{OFF}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
