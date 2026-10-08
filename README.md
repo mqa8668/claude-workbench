@@ -2,7 +2,7 @@
 
 Brakes, gauges and a flight recorder for Claude Code: config-driven gates, a context guard, checkpoints and a subagent cost ledger.
 
-<!-- demo.gif -->
+<p align="center"><img src="docs/media/demo.gif" alt="Terminal demo: bin/gate prints one-line verdicts, the context guard refuses a bare pytest, bin/agents prints the subagent ledger" width="900"></p>
 
 ![license: MIT](https://img.shields.io/badge/license-MIT-blue) ![python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![dependencies: none](https://img.shields.io/badge/dependencies-stdlib%20only-green)
 
@@ -71,6 +71,12 @@ The exit code is non-zero when any tier fails.
 | Context warning, `hooks/prompt.py` | One line to Claude above 200k tokens, a stronger one above 350k. |
 | Status line, `statusline/statusline.py` | Directory, branch, model, five-hour usage, then gate verdicts and staleness, ports and live subagents. |
 | Agents | `gate` (haiku), `scribe` (sonnet), `digger` (opus), `planner` and `reviewer` (inherit the session model). |
+
+## Screenshots
+
+<p align="center"><img src="docs/media/statusline.png" alt="Status line: directory, branch, model, five-hour usage and gate verdict with its age" width="900"></p>
+
+The status line: directory, branch, model, five-hour usage, then the gate verdict and how stale it is.
 
 ## How it works
 
