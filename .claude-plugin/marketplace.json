@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace-manifest.json",
+  "name": "claude-workbench",
+  "owner": {
+    "name": "Loc Luong",
+    "url": "https://github.com/mqa8668"
+  },
+  "description": "Session machinery for multi-tier repositories: config-driven gates, a context guard, checkpoints and a subagent ledger.",
+  "plugins": [
+    {
+      "name": "workbench",
+      "source": "./",
+      "description": "Config-driven gates (bin/gate + .claude/gates.json), a context guard, a session checkpoint, a subagent cost ledger, and five project-independent agents.",
+      "license": "MIT",
+      "keywords": [
+        "gates",
+        "hooks",
+        "subagents",
+        "context",
+        "session",
+        "delegation"
+      ]
+    }
+  ]
+}

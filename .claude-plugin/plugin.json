@@ -1,0 +1,24 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "workbench",
+  "version": "0.1.0",
+  "description": "Session machinery for a multi-tier repo: config-driven gates, a context guard, checkpoints, a subagent ledger and the agents that go with them.",
+  "author": {
+    "name": "Loc Luong",
+    "url": "https://github.com/mqa8668"
+  },
+  "skills": [
+    "./"
+  ],
+  "keywords": [
+    "gates",
+    "hooks",
+    "subagents",
+    "context",
+    "session",
+    "delegation"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/mqa8668/claude-workbench",
+  "repository": "https://github.com/mqa8668/claude-workbench"
+}
